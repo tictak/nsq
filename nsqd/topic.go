@@ -2,7 +2,10 @@ package nsqd
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"hash/crc32"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -267,27 +270,32 @@ func (t *Topic) messagePump() {
 			goto exit
 		}
 
-		for i, channel := range chans {
-			chanMsg := msg
-			// copy the message because each channel
-			// needs a unique instance but...
-			// fastpath to avoid copy if its the first channel
-			// (the topic already created the first copy)
-			if i > 0 {
-				chanMsg = NewMessage(msg.ID, msg.Body)
-				chanMsg.Timestamp = msg.Timestamp
-				chanMsg.deferred = msg.deferred
-			}
-			if chanMsg.deferred != 0 {
-				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
-				continue
-			}
-			err := channel.PutMessage(chanMsg)
-			if err != nil {
-				t.ctx.nsqd.logf(
-					"TOPIC(%s) ERROR: failed to put msg(%s) to channel(%s) - %s",
-					t.name, msg.ID, channel.name, err)
-			}
+		if len(chans) <= 0 {
+			//couldn't be here?
+			continue
+		}
+
+		msgKey, err := JsonKey(msg.Body)
+		if err != nil {
+			t.ctx.nsqd.logf(
+				"TOPIC(%s) ERROR: msg(%s) format error %s",
+				t.name, msg.ID, err)
+			continue
+		}
+		msgKey %= hashLen
+
+		sort.Sort(ChanSort(chans))
+		partLen := hashLen / uint32(len(chans))
+		chanPicked := chans[msgKey/partLen]
+		if msg.deferred != 0 {
+			chanPicked.PutMessageDeferred(msg, msg.deferred)
+			continue
+		}
+		err = chanPicked.PutMessage(msg)
+		if err != nil {
+			t.ctx.nsqd.logf(
+				"TOPIC(%s) ERROR: failed to put msg(%s) to channel(%s) - %s",
+				t.name, msg.ID, chanPicked.name, err)
 		}
 	}
 
@@ -448,4 +456,25 @@ retry:
 		goto retry
 	}
 	return id.Hex()
+}
+
+const hashLen = 32
+
+type ChanSort []*Channel
+
+func (c ChanSort) Len() int           { return len(c) }
+func (c ChanSort) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+func (c ChanSort) Less(i, j int) bool { return c[i].name < c[j].name }
+
+type taskBody struct {
+	Key string `json:"key"`
+}
+
+func JsonKey(body []byte) (uint32, error) {
+	var tb taskBody
+	err := json.Unmarshal(body, &tb)
+	if err != nil {
+		return 0, err
+	}
+	return crc32.ChecksumIEEE([]byte(tb.Key)), nil
 }
